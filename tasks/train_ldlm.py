@@ -64,6 +64,46 @@ from veomni.utils.dist_utils import all_reduce
 logger = helper.create_logger(__name__)
 
 
+KEEP_LAST_CHECKPOINTS = 2
+"""Number of latest checkpoints to keep. Older ones are pruned to save disk."""
+
+
+def prune_checkpoints(save_dir: str, keep: int = KEEP_LAST_CHECKPOINTS):
+    """
+    Remove all but the latest `keep` checkpoint directories in save_dir.
+    Only prunes on rank 0 to avoid races.
+    """
+    if dist.get_rank() != 0:
+        return
+    if not os.path.isdir(save_dir):
+        return
+    ckpt_dirs = [
+        d for d in os.listdir(save_dir)
+        if d.startswith("global_step_") and os.path.isdir(os.path.join(save_dir, d))
+    ]
+    ckpt_dirs.sort(key=lambda d: int(d.replace("global_step_", "")))
+    for old in ckpt_dirs[:-keep]:
+        path = os.path.join(save_dir, old)
+        try:
+            import shutil
+            shutil.rmtree(path)
+            logger.info(f"Pruned old checkpoint: {path}")
+        except Exception as e:
+            logger.warning(f"Failed to prune {path}: {e}")
+    # Also prune eval checkpoints (keep last 1)
+    eval_dirs = [
+        d for d in os.listdir(save_dir)
+        if d == "eval" and os.path.isdir(os.path.join(save_dir, d))
+    ]
+    if len(eval_dirs) > 1:
+        for old in eval_dirs[:-1]:
+            path = os.path.join(save_dir, old)
+            try:
+                shutil.rmtree(path)
+            except Exception:
+                pass
+
+
 @dataclass
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
@@ -603,6 +643,7 @@ def main():
                 }
                 Checkpointer.save(ckpt_path, state)
                 logger.info_rank0(f"Checkpoint saved to {ckpt_path}")
+                prune_checkpoints(args.train.save_checkpoint_path)
                 dist.barrier()
 
                 if args.train.global_rank == 0 and args.train.save_hf_weights:
@@ -652,6 +693,7 @@ def main():
             Checkpointer.save(ckpt_path, state, global_steps=global_step)
             dist.barrier()
             logger.info_rank0(f"Epoch checkpoint saved at {ckpt_path}")
+            prune_checkpoints(args.train.save_checkpoint_path)
 
             if args.train.global_rank == 0 and args.train.save_hf_weights:
                 hf_path = os.path.join(ckpt_path, "hf_ckpt")
