@@ -191,12 +191,12 @@ class LDLMAutoencoder(nn.Module):
         self.decoder_input_noise_std = decoder_input_noise_std
         self.encoder_hidden_layer = encoder_hidden_layer
 
-        # Frozen Qwen3.6 encoder (dense or MoE) — distributed across GPUs
+        # Frozen Qwen3.6 encoder (dense or MoE) — kept on CPU for memory efficiency
         self.token_encoder = AutoModel.from_pretrained(
             encoder_model_name,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map="cpu",
         )
         for p in self.token_encoder.parameters():
             p.requires_grad = False
