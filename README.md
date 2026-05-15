@@ -290,6 +290,26 @@ api.upload_folder(repo_id=REPO_ID, repo_type="model", folder_path=LOCAL_DIR)
 
 Open-dLLM supports **LDLM** (Latent Diffusion Language Model) — a Perceiver-based latent diffusion approach that compresses large autoregressive model representations into a compact latent space for diffusion-based generation. This enables training diffusion LMs on top of frozen large models (e.g., Qwen3.6-27B) with minimal trainable parameters.
 
+#### Recreating the Benchmarks
+
+```bash
+# 1. Install dependencies (see Install section above)
+pip install -e .
+
+# 2. Download the encoder model (only needed for training; benchmark downloads automatically)
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Qwen/Qwen3.6-35B-A3B')   # ~22GB download
+# snapshot_download('Qwen/Qwen3.6-27B')     # ~54GB download
+"
+
+# 3. Run inference benchmark on a single GPU
+CUDA_VISIBLE_DEVICES=0 python tasks/benchmark_ldlm_35b.py    # Qwen3.6-35B-A3B
+CUDA_VISIBLE_DEVICES=0 python tasks/benchmark_ldlm.py        # Qwen3.6-27B
+```
+
+> **Hardware used**: NVIDIA RTX 5090 (32GB VRAM), 91GB system RAM, Python 3.13, PyTorch 2.7+, CUDA 12.x.
+
 #### Inference Throughput (Qwen3.6 LDLM, untrained, RTX 5090 32GB)
 
 | Model | Dim | Trainable Params | Diffusion Steps | Throughput |
@@ -300,6 +320,17 @@ Open-dLLM supports **LDLM** (Latent Diffusion Language Model) — a Perceiver-ba
 | Qwen3.6-27B | 5120 | 6.75B | 4 | **~1,500 tok/s** |
 
 > For comparison, autoregressive generation on the same hardware achieves ~30-50 tok/s for a 27B model.
+
+#### Assumptions & Caveats
+
+- **Untrained weights**: These benchmarks use randomly initialized Perceiver/decoder/diffusion-head weights. A trained model will have identical throughput but produce coherent output. Quality benchmarks (perplexity, HumanEval) will be published after training completes.
+- **No encoder in the loop**: The frozen Qwen3.6 encoder is **not used during generation** — it's only needed for training (to produce latent targets). At inference, the diffusion head denoises random noise, then the Perceiver decoder maps latents to tokens. The encoder is deleted before benchmarking (`del autoencoder.token_encoder`).
+- **Seq len = 64**: The benchmark uses a short sequence length (64 tokens). Longer sequences will reduce throughput proportionally. The 4-step throughput numbers are linear extrapolations from the 10-step measurements.
+- **Batch size = 1**: Single-sequence generation only. Throughput scales near-linearly with batch size for the 35B-A3B (dim=2048 fits easily in VRAM), less so for the 27B (dim=5120).
+- **CPU RAM requirement**: While the encoder is not used at inference, it **must** fit in system RAM during training (~54GB for 27B, ~22GB for 35B-A3B in bf16). The Qwen3.6 architecture uses Triton kernels (flash-linear-attention) that cannot run on CPU, so the encoder forward pass during training requires GPU offloading — a multi-GPU setup is recommended for training.
+- **Qwen3.6 requires `trust_remote_code=True`**: The model uses custom architecture code (`Qwen3_5ForConditionalGeneration`) that is not in standard transformers releases. Ensure your `transformers` version supports it (>=4.54).
+- **35B-A3B is MoE**: Only 3B of its 35B parameters are active per token, giving it a much smaller hidden dim (2048) than the 27B dense model (5120). This is why the LDLM trainable components are 5x smaller and 4x faster.
+- **Not an apples-to-apples comparison with AR models**: The diffusion model generates all tokens in parallel across N diffusion steps, while AR generates one token at a time. The "tok/s" metric favors diffusion for short sequences but does not reflect output quality, which depends on training convergence.
 
 #### How to Train a Qwen3.6 LDLM
 
