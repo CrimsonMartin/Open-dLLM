@@ -55,7 +55,7 @@ BASE_REQUIRE = [
     "tiktoken>=0.9.0",
     "blobfile>=3.0.0",
     "bytecheckpoint",
-    "transformers==4.54.1",
+    "transformers>=4.57.6",  # 4.57.6+ required for qwen3_next (Qwen3.5/3.6) and qwen3_vl support
     "accelerate",
     "datasets",
     "peft",

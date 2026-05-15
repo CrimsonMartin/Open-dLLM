@@ -12,7 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import deepseek_v3, llama, qwen2, qwen2_vl, qwen3, qwen3_5, qwen3_5_moe
-
-
-__all__ = ["qwen2_vl", "deepseek_v3", "qwen2", "llama", "qwen3", "qwen3_5", "qwen3_5_moe"]
+from .configuration_qwen3_5_moe import Qwen3_5MoeConfig
+from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeModel, Qwen3_5MoePreTrainedModel
