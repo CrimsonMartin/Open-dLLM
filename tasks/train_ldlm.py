@@ -602,6 +602,27 @@ def main():
                             z0_val.std(dim=[0, 1]).detach().cpu()
                         )
 
+                # Log reconstruction text samples
+                text_interval = ldlm_cfg.get("log_interval", 50) * 5
+                if global_step % text_interval == 0:
+                    try:
+                        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            logits = fwd_out.get("logits")
+                            if logits is not None:
+                                pred_ids = logits.argmax(dim=-1)
+                                target_ids = micro_batch.get("input_ids")
+                                if target_ids is not None:
+                                    min_t = min(pred_ids.shape[1], target_ids.shape[1])
+                                    pred_text = tokenizer.decode(pred_ids[0, :min_t], skip_special_tokens=True)
+                                    target_text = tokenizer.decode(target_ids[0, :min_t], skip_special_tokens=True)
+                                    match_pct = (pred_ids[0, :min_t] == target_ids[0, :min_t]).float().mean().item() * 100
+                                    log_dict["samples/target"] = wandb.Html(
+                                        f"<b>Target:</b> {target_text}<br><b>Predicted:</b> {pred_text}<br><b>Token match:</b> {match_pct:.1f}%",
+                                        inject=False,
+                                    )
+                    except Exception:
+                        pass
+
                 wandb.log(log_dict, step=global_step)
 
             # Save checkpoint
