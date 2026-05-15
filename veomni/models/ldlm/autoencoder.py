@@ -185,7 +185,7 @@ class LDLMAutoencoder(nn.Module):
         encoder_hidden_layer: int = -3,
         decoder_num_layers: int = 3,
         perceiver_heads: int = 8,
-    ):
+    ) -> None:
         super().__init__()
         self.seq_len = seq_len
         self.decoder_input_noise_std = decoder_input_noise_std
@@ -211,6 +211,14 @@ class LDLMAutoencoder(nn.Module):
         self.latent_dim = latent_dim or self.dim
         self._vocab_size = vocab_size
 
+        # Compute nhead from dim (must divide evenly)
+        for nhead_candidate in [16, 12, 8, 4, 2]:
+            if self.dim % nhead_candidate == 0:
+                decoder_nhead = nhead_candidate
+                break
+        else:
+            decoder_nhead = 8  # safe fallback
+
         # Perceiver-based latent encoder/decoder
         self.latent_encoder = PerceiverResampler(
             dim=self.dim,
@@ -227,9 +235,7 @@ class LDLMAutoencoder(nn.Module):
 
         # Lightweight token decoder (transformer decoder)
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.dim,
-            nhead=12,
-            dim_feedforward=self.dim * 4,
+            d_model=self.dim, nhead=decoder_nhead, dim_feedforward=self.dim * 4,
             activation="gelu",
             batch_first=True,
             norm_first=True,
