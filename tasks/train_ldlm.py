@@ -332,7 +332,7 @@ def main():
     autoencoder = autoencoder.cuda()
     diffusion_head = diffusion_head.cuda()
 
-    vocab_size = autoencoder.token_encoder.config.vocab_size
+    vocab_size = autoencoder._vocab_size
     model_config = autoencoder.token_encoder.config
 
     # ------------------------------------------------------------------

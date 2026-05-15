@@ -1,6 +1,5 @@
 model:
   model_path: Qwen/Qwen3.6-35B-A3B
-  type: qwen3_5_moe
   attn_implementation: flash_attention_2
   ldlm:
     enabled: true
@@ -18,8 +17,8 @@ model:
     log_samples: true
 
 data:
-  train_path: fineweb
-  train_size: 1000000000000
+  train_path: /tmp/ldlm_test_data
+  train_size: 1000
   dataloader_type: native
   data_type: plaintext
   max_seq_len: 128          # start small for LDLM, then scale to 1024+
@@ -30,7 +29,7 @@ train:
   output_dir: Qwen3.6-35B-A3B_LDLM
   data_parallel_mode: fsdp1
   ulysses_parallel_size: 1
-  expert_parallel_size: 8
+  expert_parallel_size: 1
   global_batch_size: 32
   micro_batch_size: 1
   rmpad: false

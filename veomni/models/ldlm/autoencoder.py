@@ -200,8 +200,16 @@ class LDLMAutoencoder(nn.Module):
         for p in self.token_encoder.parameters():
             p.requires_grad = False
 
-        self.dim = self.token_encoder.config.hidden_size
+        cfg = self.token_encoder.config
+        # Handle nested config (MoE variants use text_config)
+        if hasattr(cfg, "text_config") and hasattr(cfg.text_config, "hidden_size"):
+            self.dim = cfg.text_config.hidden_size
+            vocab_size = cfg.text_config.vocab_size
+        else:
+            self.dim = cfg.hidden_size
+            vocab_size = cfg.vocab_size
         self.latent_dim = latent_dim or self.dim
+        self._vocab_size = vocab_size
 
         # Perceiver-based latent encoder/decoder
         self.latent_encoder = PerceiverResampler(
@@ -231,7 +239,7 @@ class LDLMAutoencoder(nn.Module):
             num_layers=decoder_num_layers,
             norm=nn.LayerNorm(self.dim),
         )
-        self.lm_head = nn.Linear(self.dim, self.token_encoder.config.vocab_size)
+        self.lm_head = nn.Linear(self.dim, self._vocab_size)
 
     def encode(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict:
         """

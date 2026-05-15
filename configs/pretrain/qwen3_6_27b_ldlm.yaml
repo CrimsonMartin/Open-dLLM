@@ -1,6 +1,5 @@
 model:
   model_path: Qwen/Qwen3.6-27B
-  type: qwen3_5
   attn_implementation: flash_attention_2
   ldlm:
     enabled: true
