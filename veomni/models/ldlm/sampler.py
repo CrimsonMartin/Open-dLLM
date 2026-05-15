@@ -68,14 +68,15 @@ class AdaptiveTimestepSampler:
             losses: (batch,) denoising loss L(t)
         """
         # Find which bin each timestep falls into
-        bin_indices = torch.bucketize(timesteps, self.bin_edges[1:], right=True).clamp(0, self.num_bins - 1)
+        bin_indices = torch.bucketize(timesteps.to(self.device), self.bin_edges[1:], right=True).clamp(0, self.num_bins - 1)
 
         # Update EMA per bin
+        losses_flat = losses.view(-1).to(self.device)
         for i in range(self.num_bins):
             mask = bin_indices == i
             if mask.sum() == 0:
                 continue
-            bin_loss = losses[mask].mean()
+            bin_loss = losses_flat[mask].mean()
             self.loss_ema[i] = (
                 self.ema_decay * self.loss_ema[i] + (1.0 - self.ema_decay) * bin_loss
             )

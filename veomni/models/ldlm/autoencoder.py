@@ -193,13 +193,13 @@ class LDLMAutoencoder(nn.Module):
         self.decoder_input_noise_std = decoder_input_noise_std
         self.encoder_hidden_layer = encoder_hidden_layer
 
-        # Frozen Qwen3.6 encoder (dense or MoE) — kept on CPU for memory efficiency
         self.token_encoder = AutoModel.from_pretrained(
             encoder_model_name,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
             device_map="cpu",
         )
+        self._encoder_device_map = None
         for p in self.token_encoder.parameters():
             p.requires_grad = False
 
@@ -250,15 +250,43 @@ class LDLMAutoencoder(nn.Module):
         )
         self.lm_head = nn.Linear(self.dim, self._vocab_size)
 
+    def move_encoder_to_gpus(self, max_memory=None):
+        import transformers.modeling_utils as mu
+        _orig_warmup = mu.caching_allocator_warmup
+        mu.caching_allocator_warmup = lambda *a, **k: None
+        try:
+            from transformers import AutoModel
+            self.token_encoder = AutoModel.from_pretrained(
+                self.token_encoder.config._name_or_path,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                max_memory=max_memory,
+            )
+            for p in self.token_encoder.parameters():
+                p.requires_grad = False
+            self._encoder_device_map = dict(self.token_encoder.hf_device_map)
+        finally:
+            mu.caching_allocator_warmup = _orig_warmup
+
     def encode(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict:
         device = self.latent_encoder.latents.device
         with torch.no_grad():
-            outputs = self.token_encoder(
-                input_ids.cpu(),
-                attention_mask=attention_mask.cpu() if attention_mask is not None else None,
-                output_hidden_states=True,
-            )
-            h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
+            if self._encoder_device_map is not None:
+                encoder_device = self.token_encoder.device
+                outputs = self.token_encoder(
+                    input_ids.to(encoder_device),
+                    attention_mask=attention_mask.to(encoder_device) if attention_mask is not None else None,
+                    output_hidden_states=True,
+                )
+                h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
+            else:
+                outputs = self.token_encoder(
+                    input_ids.cpu(),
+                    attention_mask=attention_mask.cpu() if attention_mask is not None else None,
+                    output_hidden_states=True,
+                )
+                h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
             del outputs
 
         z0 = self.latent_encoder(h)

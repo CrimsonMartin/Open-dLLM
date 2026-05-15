@@ -173,15 +173,17 @@ def ldlm_forward(autoencoder, diffusion_head, sampler, input_ids, attention_mask
     logits = ae_out["logits"]
 
     # 2. Reconstruction losses
-    L_h = F.mse_loss(h_hat, h)
+    min_len = min(h_hat.shape[1], h.shape[1], input_ids.shape[1])
+    L_h = F.mse_loss(h_hat[:, :min_len], h[:, :min_len])
     L_w = F.cross_entropy(
-        logits.view(-1, logits.size(-1)),
-        input_ids.view(-1),
+        logits[:, :min_len].reshape(-1, logits.size(-1)),
+        input_ids[:, :min_len].reshape(-1),
         ignore_index=-100,
     )
 
     # 3. Adaptive timestep sampling + diffusion
-    t = sampler.sample(B)
+    device = z0.device
+    t = sampler.sample(B).to(device)
 
     # Cosine-like noise schedule: alpha_bar(t) = 1 - t^2
     alpha_bar = 1.0 - t[:, None, None] ** 2
@@ -328,14 +330,27 @@ def main():
 
     autoencoder, diffusion_head, sampler = build_ldlm_components(args)
 
-    # Frozen encoder is already on device (distributed via device_map="auto")
-    # Move trainable components to GPU0
-    device = torch.device("cuda:0")
-    autoencoder.latent_encoder = autoencoder.latent_encoder.to(device)
-    autoencoder.latent_decoder = autoencoder.latent_decoder.to(device)
-    autoencoder.token_decoder = autoencoder.token_decoder.to(device)
-    autoencoder.lm_head = autoencoder.lm_head.to(device)
-    diffusion_head = diffusion_head.to(device)
+    # Multi-GPU strategy: encoder on GPU 0 (RTX 5090), trainable on GPU 1
+    n_gpus = torch.cuda.device_count()
+    if n_gpus >= 2:
+        logger.info_rank0(f"Multi-GPU: encoder on cuda:0, trainable on cuda:1")
+        autoencoder.move_encoder_to_gpus(max_memory={0: "30GiB", "cpu": "60GiB"})
+        trainable_device = torch.device("cuda:1")
+    else:
+        logger.info_rank0("Single GPU: encoder stays on CPU, trainable on cuda:0")
+        trainable_device = torch.device("cuda:0")
+
+    # Move sampler to trainable device
+    sampler.device = trainable_device
+    sampler.bin_edges = sampler.bin_edges.to(trainable_device)
+    sampler.loss_ema = sampler.loss_ema.to(trainable_device)
+    sampler.bin_probs = sampler.bin_probs.to(trainable_device)
+
+    autoencoder.latent_encoder = autoencoder.latent_encoder.to(trainable_device).to(torch.bfloat16)
+    autoencoder.latent_decoder = autoencoder.latent_decoder.to(trainable_device).to(torch.bfloat16)
+    autoencoder.token_decoder = autoencoder.token_decoder.to(trainable_device).to(torch.bfloat16)
+    autoencoder.lm_head = autoencoder.lm_head.to(trainable_device)
+    diffusion_head = diffusion_head.to(trainable_device).to(torch.bfloat16)
 
     vocab_size = autoencoder._vocab_size
     model_config = autoencoder.token_encoder.config
@@ -475,11 +490,11 @@ def main():
                 environ_meter.add(micro_batch)
 
                 micro_batch = {
-                    k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    k: v.to(trainable_device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                     for k, v in micro_batch.items()
                 }
 
-                with model_fwd_context:
+                with model_fwd_context, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     fwd_out = ldlm_forward(
                         autoencoder=model["autoencoder"],
                         diffusion_head=model["diffusion_head"],
