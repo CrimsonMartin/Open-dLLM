@@ -166,8 +166,9 @@ class LDLMTrainer:
                 "train/timestep_std": t.std().item(),
             }
 
-            # Log histograms periodically
-            if self.log_latent_histograms and step % 500 == 0:
+            # Log histograms periodically (10x log_interval)
+            hist_interval = self.log_interval * 10
+            if self.log_latent_histograms and step % hist_interval == 0:
                 log_dict["latent_stats/z0_mean"] = wandb.Histogram(
                     z0.mean(dim=[0, 1]).cpu()
                 )

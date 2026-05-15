@@ -11,6 +11,11 @@ model:
     encoder_hidden_layer: -3
     decoder_num_layers: 3
     warmup_steps: 50000
+    # Logging config (LDLMTrainer uses these for wandb)
+    log_interval: 50
+    gen_eval_interval: 2000
+    log_latent_histograms: true
+    log_samples: true
 
 data:
   train_path: fineweb

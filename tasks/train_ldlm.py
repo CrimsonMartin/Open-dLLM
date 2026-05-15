@@ -546,8 +546,8 @@ def main():
                     },
                 }
 
-                # Log latent stats every 50 steps
-                if global_step % 50 == 0:
+                # Log latent stats per log_interval
+                if global_step % ldlm_cfg.get("log_interval", 50) == 0:
                     log_dict["training/latent_norm"] = fwd_out.get("z0", torch.zeros(1)).norm(dim=-1).mean().item()
                     log_dict["training/timestep_mean"] = fwd_out.get("t_mean", torch.zeros(1)).item()
                     log_dict["training/sampler_loss_min"] = sampler.loss_ema.min().item()
@@ -556,8 +556,9 @@ def main():
                         sampler.loss_ema.max() - sampler.loss_ema.min()
                     ).item()
 
-                # Log latent histograms every 500 steps
-                if global_step % 500 == 0:
+                # Log latent histograms per 10x log_interval
+                hist_interval = ldlm_cfg.get("log_interval", 50) * 10
+                if global_step % hist_interval == 0:
                     z0_val = fwd_out.get("z0")
                     if z0_val is not None:
                         log_dict["latent_stats/z0_mean"] = wandb.Histogram(

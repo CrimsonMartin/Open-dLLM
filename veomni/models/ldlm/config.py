@@ -77,3 +77,16 @@ class LDLMArguments:
 
     diffusion_head_depth: int = 12
     """Number of diffusion transformer layers."""
+
+    # Logging
+    log_interval: int = 50
+    """Steps between wandb loss/metric logging."""
+
+    gen_eval_interval: int = 2000
+    """Steps between generation quality evaluation (PPL, entropy)."""
+
+    log_latent_histograms: bool = True
+    """Log latent z0 mean/std histograms to wandb every 500 steps."""
+
+    log_samples: bool = True
+    """Log generation samples to wandb during gen_eval."""
