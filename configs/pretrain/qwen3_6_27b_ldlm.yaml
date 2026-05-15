@@ -1,9 +1,9 @@
 model:
-  model_path: /home/johndpope/qwen36_27b_local
+  model_path: Qwen/Qwen3.6-27B
   attn_implementation: eager
   ldlm:
     enabled: true
-    encoder_model_name: /home/johndpope/qwen36_27b_local
+    encoder_model_name: Qwen/Qwen3.6-27B
     seq_len: 64
     depth: 4
     decoder_noise_std: 3.0
@@ -18,8 +18,8 @@ model:
     log_samples: true
 
 data:
-  train_path: /run/media/johndpope/12TB/open_dllm/ldlm_data/data.jsonl
-  train_size: 100000
+  train_path: fineweb
+  train_size: 1000000000000
   dataloader_type: native
   data_type: plaintext
   max_seq_len: 64
