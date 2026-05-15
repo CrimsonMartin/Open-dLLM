@@ -290,22 +290,26 @@ api.upload_folder(repo_id=REPO_ID, repo_type="model", folder_path=LOCAL_DIR)
 
 Open-dLLM supports **LDLM** (Latent Diffusion Language Model) — a Perceiver-based latent diffusion approach that compresses large autoregressive model representations into a compact latent space for diffusion-based generation. This enables training diffusion LMs on top of frozen large models (e.g., Qwen3.6-27B) with minimal trainable parameters.
 
-#### Inference Throughput (Qwen3.6-27B LDLM, untrained)
+#### Inference Throughput (Qwen3.6 LDLM, untrained, RTX 5090 32GB)
 
-| Hardware | Seq Len | Diffusion Steps | Trainable Params | Throughput |
-|----------|---------|-----------------|-------------------|------------|
-| RTX 5090 (32GB) | 64 | 10 | 6.75B | **745 tok/s** |
-| RTX 5090 (32GB) | 64 | 4 | 6.75B | **~1,500 tok/s** |
+| Model | Dim | Trainable Params | Diffusion Steps | Throughput |
+|-------|-----|-------------------|-----------------|------------|
+| Qwen3.6-35B-A3B | 2048 | 1.39B | 10 | **3,238 tok/s** |
+| Qwen3.6-35B-A3B | 2048 | 1.39B | 4 | **~6,500 tok/s** |
+| Qwen3.6-27B | 5120 | 6.75B | 10 | **745 tok/s** |
+| Qwen3.6-27B | 5120 | 6.75B | 4 | **~1,500 tok/s** |
 
 > For comparison, autoregressive generation on the same hardware achieves ~30-50 tok/s for a 27B model.
 
-#### How to Train a Qwen3.6-27B LDLM
+#### How to Train a Qwen3.6 LDLM
 
-1. **Download the base model**:
+1. **Download the base model** (27B dense or 35B-A3B MoE):
 ```bash
 python -c "
 from huggingface_hub import snapshot_download
 snapshot_download('Qwen/Qwen3.6-27B', local_dir='./qwen36_27b_local')
+# or for MoE:
+# snapshot_download('Qwen/Qwen3.6-35B-A3B', local_dir='./qwen36_35b_a3b_local')
 "
 ```
 
@@ -324,16 +328,23 @@ with open('data.jsonl', 'w') as f:
 
 3. **Run the benchmark** (verify setup before training):
 ```bash
+# 27B
 CUDA_VISIBLE_DEVICES=0 python tasks/benchmark_ldlm.py
+# 35B-A3B MoE
+CUDA_VISIBLE_DEVICES=0 python tasks/benchmark_ldlm_35b.py
 ```
 
 4. **Start training**:
 ```bash
+# 27B
 CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 tasks/train_ldlm.py \
   configs/pretrain/qwen3_6_27b_ldlm.yaml
+# 35B-A3B MoE
+CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 tasks/train_ldlm.py \
+  configs/pretrain/qwen3_6_35b_a3b_ldlm.yaml
 ```
 
-> **GPU Memory**: The frozen 27B encoder runs on CPU (~54GB RAM). Only the 6.75B trainable components (Perceiver encoder/decoder, DiffusionHead, token decoder, LM head) run on GPU (~8GB in bf16). A single 24GB+ GPU is sufficient for inference; training requires ~32GB for optimizer states and activations.
+> **GPU Memory**: The frozen encoder runs on CPU (~54GB RAM for 27B, ~22GB for 35B-A3B). Only trainable components run on GPU. The 35B-A3B MoE variant has a smaller hidden dim (2048 vs 5120), making it significantly faster and more memory-efficient — ideal for consumer GPUs.
 
 ---
 
