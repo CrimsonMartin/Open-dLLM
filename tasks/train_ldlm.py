@@ -328,9 +328,14 @@ def main():
 
     autoencoder, diffusion_head, sampler = build_ldlm_components(args)
 
-    # Move trainable params to device; autoencoder's encoder is frozen
-    autoencoder = autoencoder.cuda()
-    diffusion_head = diffusion_head.cuda()
+    # Frozen encoder is already on device (distributed via device_map="auto")
+    # Move trainable components to GPU0
+    device = torch.device("cuda:0")
+    autoencoder.latent_encoder = autoencoder.latent_encoder.to(device)
+    autoencoder.latent_decoder = autoencoder.latent_decoder.to(device)
+    autoencoder.token_decoder = autoencoder.token_decoder.to(device)
+    autoencoder.lm_head = autoencoder.lm_head.to(device)
+    diffusion_head = diffusion_head.to(device)
 
     vocab_size = autoencoder._vocab_size
     model_config = autoencoder.token_encoder.config
@@ -372,28 +377,15 @@ def main():
     helper.print_device_mem_info("VRAM after building model")
 
     # ------------------------------------------------------------------
-    # 4. DataParallel Setup (FSDP)
+    # 4. Skip FSDP — frozen encoder is already sharded via device_map="auto"
+    #    Trainable components (latent encoder/decoder, diffusion head) fit on GPU0.
     # ------------------------------------------------------------------
-    from veomni.distributed.torch_parallelize import build_parallelize_model
-
-    # Wrap autoencoder and diffusion head together
     full_model = torch.nn.ModuleDict({
         "autoencoder": autoencoder,
         "diffusion_head": diffusion_head,
     })
-
-    model = build_parallelize_model(
-        full_model,
-        init_device=args.train.init_device,
-        weights_path=None,
-        enable_full_shard=args.train.enable_full_shard,
-        enable_mixed_precision=args.train.enable_mixed_precision,
-        enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
-        enable_fsdp_offload=args.train.enable_fsdp_offload,
-        basic_modules=args.model.basic_modules,
-        enable_reentrant=args.train.enable_reentrant,
-        enable_forward_prefetch=args.train.enable_forward_prefetch,
-    )
+    model = full_model  # no FSDP wrapping
+    model.train()
 
     # ------------------------------------------------------------------
     # 5. Init wandb
