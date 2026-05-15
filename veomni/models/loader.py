@@ -20,10 +20,9 @@ from abc import ABC
 import torch
 from transformers import (
     AutoModelForCausalLM,
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     PreTrainedModel,
 )
-from transformers.modeling_utils import no_init_weights
 
 from ..utils import logging
 from ..utils.import_utils import is_torch_npu_available, is_vescale_available
@@ -48,8 +47,8 @@ class HuggingfaceLoader(BaseModelLoader):
 
     def load_model(self, init_kwargs: dict, **kwargs):
         model_config = init_kwargs["config"]
-        if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
-            load_class = AutoModelForVision2Seq
+        if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
+            load_class = AutoModelForImageTextToText
         else:
             load_class = AutoModelForCausalLM
 
@@ -76,7 +75,7 @@ class HuggingfaceLoader(BaseModelLoader):
                 with meta_device_init():
                     model = self.model_cls._from_config(**init_kwargs)
             else:
-                with init_empty_weights(), no_init_weights():
+                with init_empty_weights():
                     model = load_class.from_config(**init_kwargs)
             if not empty_init:
                 load_model_weights(model, weights_path, init_device)
@@ -122,7 +121,7 @@ class CustomizedModelingLoader(BaseModelLoader):
                 with meta_device_init():
                     model = self.model_cls._from_config(**init_kwargs)
             else:
-                with init_empty_weights(), no_init_weights():
+                with init_empty_weights():
                     model = self.model_cls._from_config(**init_kwargs)
             if not empty_init:
                 load_model_weights(model, weights_path, init_device)

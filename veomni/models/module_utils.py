@@ -27,13 +27,18 @@ from torch import nn
 from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
-from transformers.utils.import_utils import is_safetensors_available
 
 from ..utils import logging
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 
 
-if is_safetensors_available():
+try:
+    import safetensors
+    _is_safetensors_available = True
+except ImportError:
+    _is_safetensors_available = False
+
+if _is_safetensors_available:
     from safetensors import safe_open
     from safetensors.torch import save_file
 

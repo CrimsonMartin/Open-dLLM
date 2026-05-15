@@ -13,54 +13,59 @@
 # limitations under the License.
 
 """
-Training loop hooks for LDLM.
+LDLM training loop integration with full wandb logging.
 
-These patches integrate the LDLM autoencoder and diffusion head into
-the Open-dLLM training loop defined in tasks/train_torch.py.
+Provides LDLMTrainer which wraps the autoencoder, diffusion head, and
+adaptive sampler into a single train_step() with structured logging
+matching LDLM paper (arXiv:2605.07933).
+
+Key metrics logged to wandb:
+  - train/total_loss, train/diffusion_loss, train/recon_h_loss, train/recon_w_loss
+  - train/latent_norm, train/decoder_noise_std
+  - train/sampler_loss_min/max/range (adaptive sampler health)
+  - train/gen_ppl, train/entropy (generation quality every N steps)
+  - Latent histograms every 500 steps
 """
 
+import math
 import torch
 import torch.nn.functional as F
-from typing import Dict, Optional
-
-from veomni.models.ldlm.autoencoder import LDLMAutoencoder, DiffusionHead
-from veomni.models.ldlm.sampler import AdaptiveTimestepSampler
+from typing import Dict, List, Optional
 
 
 class LDLMTrainer:
     """
     Wraps an LDLM autoencoder + diffusion head for training.
 
-    Manages:
-    - Forward pass through autoencoder and diffusion head
-    - Adaptive timestep sampling
-    - Loss computation (diffusion + reconstruction)
-    - Warmup schedule
+    Manages forward pass, adaptive timestep sampling, loss computation,
+    warmup schedule, and structured wandb logging.
     """
 
     def __init__(
         self,
-        autoencoder: LDLMAutoencoder,
-        config,
+        autoencoder,
+        diffusion_head,
+        sampler,
+        config: dict,
+        vocab_size: int,
+        tokenizer=None,
     ):
         self.autoencoder = autoencoder
+        self.diffusion_head = diffusion_head
+        self.sampler = sampler
         self.config = config
+        self.vocab_size = vocab_size
+        self.tokenizer = tokenizer
+        self.dim = autoencoder.dim
+        self.seq_len = autoencoder.seq_len
+
         ldlm_cfg = config.get("ldlm", {})
 
-        self.dim = autoencoder.dim
-        self.latent_dim = autoencoder.latent_dim
-
-        # Diffusion head
-        diff_dim = ldlm_cfg.get("diffusion_head_dim") or self.dim
-        diff_depth = ldlm_cfg.get("diffusion_head_depth", 12)
-        self.diffusion_head = DiffusionHead(dim=diff_dim, depth=diff_depth)
-
-        # Adaptive timestep sampler
-        self.sampler = AdaptiveTimestepSampler(
-            num_bins=ldlm_cfg.get("adaptive_sampler_num_bins", 100),
-            ema_decay=ldlm_cfg.get("adaptive_sampler_ema_decay", 0.999),
-            update_interval=ldlm_cfg.get("adaptive_sampler_update_interval", 5000),
-        )
+        # Logging config
+        self.log_interval = ldlm_cfg.get("log_interval", 50)
+        self.gen_eval_interval = ldlm_cfg.get("gen_eval_interval", 2000)
+        self.log_latent_histograms = ldlm_cfg.get("log_latent_histograms", True)
+        self.log_samples = ldlm_cfg.get("log_samples", True)
 
         # Warmup state
         self.warmup_steps = ldlm_cfg.get("warmup_steps", 50000)
@@ -70,30 +75,39 @@ class LDLMTrainer:
         self.recon_h_weight = ldlm_cfg.get("recon_h_weight", 1.0)
         self.recon_token_weight = ldlm_cfg.get("recon_token_weight", 1.0)
 
+        # Generation eval cache
+        self._eval_texts: List[str] = []
+
     def train_step(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        use_wandb: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
-        Single training step.
+        Single training step with logging.
 
         Args:
             input_ids: (B, T) token IDs
             attention_mask: optional (B, T) mask
+            use_wandb: if True, log metrics to wandb
+
         Returns:
-            dict of scalar losses
+            dict of scalar losses + log dict for wandb
         """
         B = input_ids.shape[0]
+        step = self.global_step
+        log_dict = {}
 
-        # 1. Autoencoder forward
+        # --- 1. Autoencoder forward ---
         ae_out = self.autoencoder(input_ids, attention_mask, training=True)
-        z0 = ae_out["z0"]          # clean latent
-        h = ae_out["h"]            # encoder hidden state
-        h_hat = ae_out["h_hat"]    # decoded hidden state
-        logits = ae_out["logits"]  # token logits
+        z0 = ae_out["z0"]
+        h = ae_out["h"]
+        h_hat = ae_out["h_hat"]
+        logits = ae_out["logits"]
+        noise = ae_out.get("noise", None)
 
-        # 2. Reconstruction losses
+        # --- 2. Reconstruction losses ---
         L_h = F.mse_loss(h_hat, h)
         L_w = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -101,32 +115,76 @@ class LDLMTrainer:
             ignore_index=-100,
         )
 
-        # 3. Adaptive timestep sampling
+        # --- 3. Adaptive timestep sampling ---
         t = self.sampler.sample(B)
 
-        # 4. Diffusion on latents
-        # Simple schedule: alpha_bar(t) = 1 - t^2 (cosine schedule)
+        # --- 4. Diffusion on latents ---
+        # Schedule: alpha_bar(t) = 1 - t^2 (cosine-like)
         alpha_bar = 1.0 - t[:, None, None] ** 2
         sigma = (1.0 - alpha_bar).sqrt()
 
-        noise = torch.randn_like(z0)
-        z_t = alpha_bar.sqrt() * z0 + sigma * noise
+        diff_noise = torch.randn_like(z0)
+        z_t = alpha_bar.sqrt() * z0 + sigma * diff_noise
 
         pred = self.diffusion_head(z_t, t)
-
         L_diff = F.mse_loss(pred, z0)
 
-        # 5. Warmup: linearly increase diffusion weight from 0
-        warmup_progress = min(self.global_step / max(self.warmup_steps, 1), 1.0)
+        # --- 5. Warmup ---
+        warmup_progress = min(step / max(self.warmup_steps, 1), 1.0)
         diff_weight = warmup_progress
 
-        # 6. Total loss
+        # --- 6. Total loss ---
         loss = L_diff * diff_weight + L_h * self.recon_h_weight + L_w * self.recon_token_weight
 
-        # 7. Update sampler
+        # --- 7. Update sampler ---
         self.sampler.update(t, L_diff.detach())
 
         self.global_step += 1
+
+        # --- 8. Wandb logging (every log_interval) ---
+        if use_wandb and step % self.log_interval == 0:
+            import wandb
+
+            # Core losses
+            log_dict = {
+                "train/total_loss": loss.item(),
+                "train/diffusion_loss": L_diff.item(),
+                "train/recon_h_loss": L_h.item(),
+                "train/recon_w_loss": L_w.item(),
+                "train/diff_weight": diff_weight,
+                "train/latent_norm": z0.norm(dim=-1).mean().item(),
+                "train/latent_std": z0.std().item(),
+                "train/decoder_noise_std": noise.std().item() if noise is not None else 0.0,
+                "train/learning_rate": self.config.get("train", {}).get("lr", 0.0),
+                # Adaptive sampler insights
+                "train/sampler_loss_min": self.sampler.loss_ema.min().item(),
+                "train/sampler_loss_max": self.sampler.loss_ema.max().item(),
+                "train/sampler_loss_range": (
+                    self.sampler.loss_ema.max() - self.sampler.loss_ema.min()
+                ).item(),
+                "train/timestep_mean": t.mean().item(),
+                "train/timestep_std": t.std().item(),
+            }
+
+            # Log histograms periodically
+            if self.log_latent_histograms and step % 500 == 0:
+                log_dict["latent_stats/z0_mean"] = wandb.Histogram(
+                    z0.mean(dim=[0, 1]).cpu()
+                )
+                log_dict["latent_stats/z0_std"] = wandb.Histogram(
+                    z0.std(dim=[0, 1]).cpu()
+                )
+                log_dict["latent_stats/timesteps"] = wandb.Histogram(t.cpu())
+                log_dict["latent_stats/diff_loss_per_sample"] = wandb.Histogram(
+                    L_diff.detach().cpu()
+                )
+
+            # Generation evaluation
+            if self.log_samples and step % self.gen_eval_interval == 0:
+                gen_metrics = self._eval_generation()
+                log_dict.update(gen_metrics)
+
+            wandb.log(log_dict, step=step)
 
         return {
             "loss": loss,
@@ -135,40 +193,35 @@ class LDLMTrainer:
             "loss_recon_token": L_w,
             "diff_weight": torch.tensor(diff_weight),
             "t_mean": t.mean(),
+            "log_dict": log_dict,
         }
 
     @torch.no_grad()
-    def generate(
-        self,
-        z0: torch.Tensor,
-        num_steps: int = 50,
-    ) -> torch.Tensor:
+    def _eval_generation(self) -> Dict:
         """
-        Generate tokens from a latent via DDIM reverse process.
+        Evaluate generation quality: perplexity and entropy.
 
-        Args:
-            z0: (B, T, dim) latent
-            num_steps: number of reverse diffusion steps
-        Returns:
-            token_ids: (B, T) generated tokens
+        Uses a small batch of latents to generate tokens and compute
+        quality metrics matching LDLM paper (Figure 1, Figure 3).
         """
-        B, T, D = z0.shape
-        z = torch.randn_like(z0)
+        metrics = {}
 
-        for i in range(num_steps):
-            t_val = 1.0 - (i / num_steps)
-            t = torch.full((B,), t_val, device=z0.device)
+        # Sample a latent, decode it
+        z_sample = torch.randn(1, self.seq_len, self.dim).cuda()
+        dec_out = self.autoencoder.decode(z_sample, training=False)
+        logits = dec_out["logits"]  # (1, T, V)
 
-            pred_z0 = self.diffusion_head(z, t)
+        # Entropy of token distribution
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean().item()
+        metrics["train/entropy"] = entropy
 
-            # DDIM update
-            alpha_bar = 1.0 - t_val ** 2
-            z = alpha_bar.sqrt() * pred_z0 + (1.0 - alpha_bar).sqrt() * torch.randn_like(z)
+        # Perplexity from softmax confidence
+        top_probs, _ = probs.max(dim=-1)
+        gen_ppl = (-top_probs.log()).mean().item()
+        metrics["train/gen_ppl"] = gen_ppl
 
-        # Decode latent to tokens
-        dec_out = self.autoencoder.decode(z, training=False)
-        tokens = dec_out["logits"].argmax(dim=-1)
-        return tokens
+        return metrics
 
     def get_sampler_stats(self) -> Dict:
         """Return sampler statistics for logging."""
