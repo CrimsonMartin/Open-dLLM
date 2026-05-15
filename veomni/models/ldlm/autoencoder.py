@@ -39,7 +39,9 @@ class PreNorm(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.fn = fn
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context: torch.Tensor = None, **kwargs) -> torch.Tensor:
+        if context is not None:
+            return self.fn(self.norm(x), context=context, **kwargs)
         return self.fn(self.norm(x), **kwargs)
 
 
@@ -249,22 +251,15 @@ class LDLMAutoencoder(nn.Module):
         self.lm_head = nn.Linear(self.dim, self._vocab_size)
 
     def encode(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict:
-        """
-        Encode input tokens into latent representation.
-
-        Args:
-            input_ids: (B, T) token IDs
-            attention_mask: optional (B, T) mask
-        Returns:
-            dict with 'z0' (latent), 'h' (encoder hidden state)
-        """
+        device = self.latent_encoder.latents.device
         with torch.no_grad():
             outputs = self.token_encoder(
-                input_ids,
-                attention_mask=attention_mask,
+                input_ids.cpu(),
+                attention_mask=attention_mask.cpu() if attention_mask is not None else None,
                 output_hidden_states=True,
             )
-            h = outputs.hidden_states[self.encoder_hidden_layer]
+            h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
+            del outputs
 
         z0 = self.latent_encoder(h)
         return {"z0": z0, "h": h}

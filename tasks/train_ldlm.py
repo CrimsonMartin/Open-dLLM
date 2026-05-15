@@ -352,27 +352,14 @@ def main():
         + list(autoencoder.lm_head.parameters())
     )
 
-    optimizer = build_optimizer(
+    optimizer = torch.optim.AdamW(
         trainable_params,
-        args.train.optimizer,
-        args.train.lr,
-        args.train.weight_decay,
-        args.train.adam_beta1,
-        args.train.adam_beta2,
-        args.train.adam_eps,
-        args.train.fp32_adam,
-        args.train.optimizer_fused,
+        lr=args.train.lr,
+        weight_decay=args.train.weight_decay,
     )
 
-    lr_scheduler = build_lr_scheduler(
-        optimizer=optimizer,
-        lr_decay_style=args.train.lr_decay_style,
-        lr_warmup_ratio=args.train.lr_warmup_ratio,
-        lr_decay_ratio=args.train.lr_decay_ratio,
-        num_train_steps=args.train.train_steps * args.train.num_train_epochs,
-        lr=args.train.lr,
-        min_lr=args.train.min_lr,
-    )
+    from torch.optim.lr_scheduler import ConstantLR
+    lr_scheduler = ConstantLR(optimizer, factor=1.0, total_iters=0)
 
     helper.print_device_mem_info("VRAM after building model")
 
