@@ -294,16 +294,21 @@ class LDLMAutoencoder(nn.Module):
             del outputs
 
         if self._normalize_hidden_states and self.training:
+            h_mean = self._h_mean.to(h.device)
+            h_var = self._h_var.to(h.device)
+            h_count = self._h_count.to(h.device)
             batch_mean = h.mean()
             batch_var = h.var(unbiased=False)
             count = h.numel()
-            new_count = self._h_count + count
-            self._h_mean.copy_(self._h_mean * (self._h_count / new_count) + batch_mean * (count / new_count))
-            self._h_var.copy_(self._h_var * (self._h_count / new_count) + batch_var * (count / new_count))
+            new_count = h_count + count
+            h_mean = h_mean * (h_count / new_count) + batch_mean * (count / new_count)
+            h_var = h_var * (h_count / new_count) + batch_var * (count / new_count)
+            self._h_mean.copy_(h_mean)
+            self._h_var.copy_(h_var)
             self._h_count.copy_(new_count)
 
         if self._normalize_hidden_states and self._h_count > 0:
-            h = (h - self._h_mean) / (self._h_var.sqrt().clamp(min=1e-6))
+            h = (h - self._h_mean.to(h.device)) / (self._h_var.to(h.device).sqrt().clamp(min=1e-6))
 
         z0 = self.latent_encoder(h)
         return {"z0": z0, "h": h}
