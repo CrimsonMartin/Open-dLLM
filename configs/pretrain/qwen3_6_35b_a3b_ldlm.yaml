@@ -54,9 +54,9 @@ train:
   init_device: cuda
   enable_full_determinism: false
   empty_cache_steps: 100
-  ckpt_manager: dcp
+  ckpt_manager: native
   load_checkpoint_path: ""
-  save_steps: 100
+  save_steps: 500
   save_hf_weights: true
   wandb_project: Qwen3.6-35B-A3B-LDLM
-  wandb_name: Qwen3.6-35B-A3B-LDLM-2GPU
+  wandb_name: Qwen3.6-35B-A3B-LDLM-paper-recipe
