@@ -11,6 +11,9 @@ model:
     decoder_num_layers: 2
     diffusion_head_depth: 4
     warmup_steps: 50000
+    warmup_gamma_min: 0.001
+    tangent_d: 3.0
+    self_condition_prob: 0.5
     log_interval: 50
     gen_eval_interval: 2000
     log_latent_histograms: true

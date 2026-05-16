@@ -181,23 +181,44 @@ def ldlm_forward(autoencoder, diffusion_head, sampler, input_ids, attention_mask
         ignore_index=-100,
     )
 
-    # 3. Adaptive timestep sampling + diffusion
+    # 3. Adaptive timestep sampling + diffusion with self-conditioning
     device = z0.device
     t = sampler.sample(B).to(device)
 
-    # Cosine-like noise schedule: alpha_bar(t) = 1 - t^2
-    alpha_bar = 1.0 - t[:, None, None] ** 2
-    sigma = (1.0 - alpha_bar).sqrt()
+    # Tangent noise schedule (d=3, from COSMOS / LDLM)
+    d_schedule = ldlm_cfg.get("tangent_d", 3.0)
+    alpha_bar = (1.0 - t[:, None, None] ** d_schedule).clamp(min=1e-8)
+    sigma = (1.0 - alpha_bar).sqrt().clamp(min=1e-8)
 
     diff_noise = torch.randn_like(z0)
     z_t = alpha_bar.sqrt() * z0 + sigma * diff_noise
 
-    pred = diffusion_head(z_t, t)
+    # Self-conditioning (LDLM Section 4.2): 50% chance to feed previous estimate
+    z_hat_prev = None
+    sc_prob = ldlm_cfg.get("self_condition_prob", 0.5)
+    if torch.rand(1).item() < sc_prob:
+        with torch.no_grad():
+            z_hat_prev = diffusion_head(z_t, t)
+            z_hat_prev = z_hat_prev.detach()
+
+    pred = diffusion_head(z_t, t, z_hat_prev=z_hat_prev)
     L_diff = F.mse_loss(pred, z0)
 
-    # 4. Warmup schedule (LDLM Section 5.2)
-    warmup_progress = min(step / max(warmup_steps, 1), 1.0)
-    diff_weight = warmup_progress
+    # 4. Sigmoid warmup schedule (LDLM Eq 29-30, Section 5.2)
+    # gamma(s) = gamma_min + (1 - gamma_min) * (sigma_tilde(s) - sigma_tilde(0)) / (sigma_tilde(S_wu) - sigma_tilde(0))
+    gamma_min = ldlm_cfg.get("warmup_gamma_min", 0.001)
+    if step >= warmup_steps:
+        diff_weight = 1.0
+    elif warmup_steps <= 0:
+        diff_weight = 1.0
+    else:
+        k = 10.0
+        c = 0.8
+        s_ratio = step / warmup_steps
+        sigma_tilde_s = torch.sigmoid(torch.tensor(k * (s_ratio - c)))
+        sigma_tilde_0 = torch.sigmoid(torch.tensor(k * (0.0 - c)))
+        sigma_tilde_S = torch.sigmoid(torch.tensor(k * (1.0 - c)))
+        diff_weight = (gamma_min + (1.0 - gamma_min) * (sigma_tilde_s - sigma_tilde_0) / (sigma_tilde_S - sigma_tilde_0)).item()
 
     # 5. Total loss
     recon_h_wt = ldlm_cfg.get("recon_h_weight", 1.0)
@@ -215,6 +236,7 @@ def ldlm_forward(autoencoder, diffusion_head, sampler, input_ids, attention_mask
         "diff_weight": diff_weight,
         "t_mean": t.mean(),
         "z0": z0,
+        "logits": logits,
     }
 
 

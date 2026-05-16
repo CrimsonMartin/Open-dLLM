@@ -27,7 +27,6 @@ import torch.nn.functional as F
 from transformers import AutoModel
 from typing import Dict, Optional, Tuple
 
-
 # ---------------------------------------------------------------------------
 # Perceiver components
 # ---------------------------------------------------------------------------
@@ -193,6 +192,11 @@ class LDLMAutoencoder(nn.Module):
         self.decoder_input_noise_std = decoder_input_noise_std
         self.encoder_hidden_layer = encoder_hidden_layer
 
+        self.register_buffer("_h_mean", torch.zeros(1))
+        self.register_buffer("_h_var", torch.ones(1))
+        self.register_buffer("_h_count", torch.tensor(0.0))
+        self._normalize_hidden_states = True
+
         self.token_encoder = AutoModel.from_pretrained(
             encoder_model_name,
             trust_remote_code=True,
@@ -289,6 +293,18 @@ class LDLMAutoencoder(nn.Module):
                 h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
             del outputs
 
+        if self._normalize_hidden_states and self.training:
+            batch_mean = h.mean()
+            batch_var = h.var(unbiased=False)
+            count = h.numel()
+            new_count = self._h_count + count
+            self._h_mean.copy_(self._h_mean * (self._h_count / new_count) + batch_mean * (count / new_count))
+            self._h_var.copy_(self._h_var * (self._h_count / new_count) + batch_var * (count / new_count))
+            self._h_count.copy_(new_count)
+
+        if self._normalize_hidden_states and self._h_count > 0:
+            h = (h - self._h_mean) / (self._h_var.sqrt().clamp(min=1e-6))
+
         z0 = self.latent_encoder(h)
         return {"z0": z0, "h": h}
 
@@ -361,20 +377,23 @@ class DiffusionHead(nn.Module):
 
     Can be attached on top of LDLMAutoencoder latents for
     diffusion-based generation in latent space.
+
+    Supports self-conditioning (LDLM Section 4.2): with probability 0.5,
+    the denoiser receives its own previous estimate as additional input.
     """
     def __init__(self, dim: int = 2048, depth: int = 12, heads: int = 8):
         super().__init__()
         self.dim = dim
         self.depth = depth
 
-        # Time embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(1, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
 
-        # Transformer blocks with adaptive layer norm (adaLN)
+        self.proj_in = nn.Linear(dim * 2, dim)
+
         self.blocks = nn.ModuleList()
         for _ in range(depth):
             self.blocks.append(nn.ModuleList([
@@ -386,19 +405,24 @@ class DiffusionHead(nn.Module):
 
         self.out_norm = nn.LayerNorm(dim)
 
-    def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, t: torch.Tensor, z_hat_prev: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             z: (B, T, dim) noisy latent
             t: (B,) or (B, 1) timestep in [0, 1]
+            z_hat_prev: (B, T, dim) optional previous denoised estimate for self-conditioning
         Returns:
             denoised prediction of same shape as z
         """
         if t.dim() == 1:
             t = t.unsqueeze(-1)
-        t_emb = self.time_mlp(t.float()).unsqueeze(1)  # (B, 1, dim)
+        t_emb = self.time_mlp(t.float()).unsqueeze(1)
 
-        x = z + t_emb
+        if z_hat_prev is not None:
+            x = self.proj_in(torch.cat([z, z_hat_prev], dim=-1))
+        else:
+            x = z
+        x = x + t_emb
         for norm1, attn, norm2, ff in self.blocks:
             x = attn(norm1(x)) + x
             x = ff(norm2(x)) + x
