@@ -9,7 +9,7 @@ model:
     decoder_noise_std: 3.0
     encoder_hidden_layer: -3
     decoder_num_layers: 2
-    diffusion_head_depth: 4
+    diffusion_head_depth: 3
     warmup_steps: 50000
     warmup_gamma_min: 0.001
     tangent_d: 3.0
@@ -54,7 +54,7 @@ train:
   init_device: cuda
   enable_full_determinism: false
   empty_cache_steps: 100
-  ckpt_manager: native
+  ckpt_manager: bytecheckpoint
   load_checkpoint_path: ""
   save_steps: 500
   save_hf_weights: true
