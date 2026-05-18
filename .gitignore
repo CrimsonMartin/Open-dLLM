@@ -182,3 +182,8 @@ eval/eval_infill/infill_results/*
 
 data
 logs/
+
+# LDLM training outputs & local model weights
+Qwen2.5-0.5B_LDLM_*/
+/models/
+*.mmap/

@@ -24,7 +24,7 @@ Reference: LDLM (arXiv:2605.07933)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel
+from transformers import AutoModel, AutoConfig
 from typing import Dict, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -186,35 +186,50 @@ class LDLMAutoencoder(nn.Module):
         encoder_hidden_layer: int = -3,
         decoder_num_layers: int = 3,
         perceiver_heads: int = 8,
+        skip_encoder: bool = False,
+        share_lm_head: bool = False,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
         self.decoder_input_noise_std = decoder_input_noise_std
         self.encoder_hidden_layer = encoder_hidden_layer
+        self.share_lm_head = share_lm_head
 
         self.register_buffer("_h_mean", torch.zeros(1))
         self.register_buffer("_h_var", torch.ones(1))
         self.register_buffer("_h_count", torch.tensor(0.0))
         self._normalize_hidden_states = True
 
-        self.token_encoder = AutoModel.from_pretrained(
-            encoder_model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map="cpu",
-        )
-        self._encoder_device_map = None
-        for p in self.token_encoder.parameters():
-            p.requires_grad = False
+        self.register_buffer("_z0_ema_std", torch.ones(1))
 
-        cfg = self.token_encoder.config
-        # Handle nested config (MoE variants use text_config)
-        if hasattr(cfg, "text_config") and hasattr(cfg.text_config, "hidden_size"):
-            self.dim = cfg.text_config.hidden_size
-            vocab_size = cfg.text_config.vocab_size
+        if skip_encoder:
+            self.token_encoder = None
+            self._encoder_device_map = None
+            cfg = AutoConfig.from_pretrained(encoder_model_name, trust_remote_code=True)
+            if hasattr(cfg, "text_config") and hasattr(cfg.text_config, "hidden_size"):
+                self.dim = cfg.text_config.hidden_size
+                vocab_size = cfg.text_config.vocab_size
+            else:
+                self.dim = cfg.hidden_size
+                vocab_size = cfg.vocab_size
         else:
-            self.dim = cfg.hidden_size
-            vocab_size = cfg.vocab_size
+            self.token_encoder = AutoModel.from_pretrained(
+                encoder_model_name,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                device_map="cpu",
+            )
+            self._encoder_device_map = None
+            for p in self.token_encoder.parameters():
+                p.requires_grad = False
+
+            cfg = self.token_encoder.config
+            if hasattr(cfg, "text_config") and hasattr(cfg.text_config, "hidden_size"):
+                self.dim = cfg.text_config.hidden_size
+                vocab_size = cfg.text_config.vocab_size
+            else:
+                self.dim = cfg.hidden_size
+                vocab_size = cfg.vocab_size
         self.latent_dim = latent_dim or self.dim
         self._vocab_size = vocab_size
 
@@ -240,19 +255,52 @@ class LDLMAutoencoder(nn.Module):
             heads=perceiver_heads,
         )
 
-        # Lightweight token decoder (transformer decoder)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.dim, nhead=decoder_nhead, dim_feedforward=self.dim * 4,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.token_decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=decoder_num_layers,
-            norm=nn.LayerNorm(self.dim),
-        )
-        self.lm_head = nn.Linear(self.dim, self._vocab_size)
+        if share_lm_head:
+            # Use the target model's pre-trained LM head (frozen) with its
+            # final RMSNorm, matching the original model's forward path:
+            #   last_hidden -> RMSNorm -> lm_head -> logits
+            self.token_decoder = None
+            if self.token_encoder is not None:
+                lm_weight = self.token_encoder.embed_tokens.weight.data.clone().float()
+                norm_weight = self._get_final_norm_weight(self.token_encoder)
+            else:
+                from transformers import AutoModelForCausalLM
+                tmp = AutoModelForCausalLM.from_pretrained(
+                    encoder_model_name, trust_remote_code=True, torch_dtype=torch.float32,
+                )
+                lm_weight = tmp.lm_head.weight.data.clone()
+                norm_weight = self._get_final_norm_weight(tmp.model if hasattr(tmp, "model") else tmp)
+                del tmp
+            self.final_norm = nn.RMSNorm(self.dim, eps=1e-6)
+            if norm_weight is not None:
+                self.final_norm.weight = nn.Parameter(norm_weight, requires_grad=False)
+            else:
+                self.final_norm.weight.requires_grad = False
+            self.lm_head = nn.Linear(self.dim, self._vocab_size, bias=False)
+            self.lm_head.weight = nn.Parameter(lm_weight, requires_grad=False)
+        else:
+            # Original LDLM: learned token decoder + fresh LM head
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=self.dim, nhead=decoder_nhead, dim_feedforward=self.dim * 4,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.token_decoder = nn.TransformerDecoder(
+                decoder_layer,
+                num_layers=decoder_num_layers,
+                norm=nn.LayerNorm(self.dim),
+            )
+            self.lm_head = nn.Linear(self.dim, self._vocab_size)
+
+    @staticmethod
+    def _get_final_norm_weight(model_or_base):
+        """Extract the final RMSNorm weight from a HuggingFace model."""
+        for attr in ("norm", "final_layernorm", "ln_f"):
+            norm = getattr(model_or_base, attr, None)
+            if norm is not None and hasattr(norm, "weight"):
+                return norm.weight.data.clone().float()
+        return None
 
     def move_encoder_to_gpus(self, max_memory=None):
         import transformers.modeling_utils as mu
@@ -269,11 +317,15 @@ class LDLMAutoencoder(nn.Module):
             )
             for p in self.token_encoder.parameters():
                 p.requires_grad = False
-            self._encoder_device_map = dict(self.token_encoder.hf_device_map)
+            if hasattr(self.token_encoder, "hf_device_map"):
+                self._encoder_device_map = dict(self.token_encoder.hf_device_map)
+            else:
+                self._encoder_device_map = {"": 0}
         finally:
             mu.caching_allocator_warmup = _orig_warmup
 
-    def encode(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict:
+    def encode_hidden(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run frozen encoder and return normalized hidden states (before Perceiver)."""
         device = self.latent_encoder.latents.device
         with torch.no_grad():
             if self._encoder_device_map is not None:
@@ -310,7 +362,23 @@ class LDLMAutoencoder(nn.Module):
         if self._normalize_hidden_states and self._h_count > 0:
             h = (h - self._h_mean.to(h.device)) / (self._h_var.to(h.device).sqrt().clamp(min=1e-6))
 
+        return h
+
+    def encode_latent(self, h: torch.Tensor) -> torch.Tensor:
+        """Run Perceiver encoder + z0 normalization on hidden states."""
         z0 = self.latent_encoder(h)
+
+        with torch.no_grad():
+            z0_std = z0.std().clamp(min=0.01)
+            if self.training:
+                self._z0_ema_std.mul_(0.99).add_(z0_std.to(self._z0_ema_std.device), alpha=0.01)
+        z0 = z0 / self._z0_ema_std.to(z0.device).clamp(min=0.01)
+
+        return z0
+
+    def encode(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict:
+        h = self.encode_hidden(input_ids, attention_mask)
+        z0 = self.encode_latent(h)
         return {"z0": z0, "h": h}
 
     def decode(self, z: torch.Tensor, training: bool = True) -> Dict:
@@ -332,16 +400,21 @@ class LDLMAutoencoder(nn.Module):
 
         h_hat = self.latent_decoder(z_noisy)
 
-        # Autoregressive token prediction
-        h_detached = h_hat.detach() if training else h_hat
-        B, T, D = h_hat.shape
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(T).to(h_hat.device)
-        token_hidden = self.token_decoder(
-            tgt=h_detached,
-            memory=h_detached,
-            tgt_mask=causal_mask,
-        )
-        logits = self.lm_head(token_hidden)
+        if self.share_lm_head:
+            # Denormalize back to original scale for the frozen LM head.
+            h_for_lm = h_hat
+            if self._h_count > 0:
+                h_std = self._h_var.to(h_hat.device).sqrt().clamp(min=1e-6)
+                h_for_lm = h_hat * h_std + self._h_mean.to(h_hat.device)
+            logits = self.lm_head(self.final_norm(h_for_lm))
+        else:
+            # Original LDLM: detached token decoder + learned LM head
+            h_detached = h_hat.detach() if training else h_hat
+            token_hidden = self.token_decoder(
+                tgt=h_detached,
+                memory=h_detached,
+            )
+            logits = self.lm_head(token_hidden)
 
         return {
             "logits": logits,
@@ -373,66 +446,113 @@ class LDLMAutoencoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Diffusion Head (Lightweight DiT)
+# Diffusion Head (DiT with AdaLN)
 # ---------------------------------------------------------------------------
+
+def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sinusoidal positional embedding for scalar timesteps."""
+    half = dim // 2
+    freqs = torch.exp(-torch.arange(half, device=t.device, dtype=torch.float32) * (torch.log(torch.tensor(10000.0)) / half))
+    args = t.unsqueeze(-1).float() * freqs.unsqueeze(0)
+    emb = torch.cat([args.cos(), args.sin()], dim=-1)
+    return emb.to(t.dtype) if t.is_floating_point() else emb
+
+
+class AdaLNDiTBlock(nn.Module):
+    """DiT block with Adaptive LayerNorm-Zero conditioning and optional cross-attention."""
+    def __init__(self, dim: int, heads: int = 8, has_cross_attn: bool = False):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = SelfAttention(dim, heads=heads)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.ff = FeedForward(dim)
+
+        self.has_cross_attn = has_cross_attn
+        if has_cross_attn:
+            self.norm_cross = nn.LayerNorm(dim, elementwise_affine=False)
+            self.cross_attn = CrossAttention(dim, heads=heads)
+            self.cross_gate = nn.Parameter(torch.zeros(1, 1, dim))
+            self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        else:
+            self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        shift_attn, scale_attn, gate_attn, shift_ff, scale_ff, gate_ff = \
+            self.adaLN(cond).unsqueeze(1).chunk(6, dim=-1)
+        h = self.norm1(x) * (1 + scale_attn) + shift_attn
+        x = x + gate_attn * self.attn(h)
+        if self.has_cross_attn and context is not None:
+            x = x + self.cross_gate * self.cross_attn(self.norm_cross(x), context=context)
+        h = self.norm2(x) * (1 + scale_ff) + shift_ff
+        x = x + gate_ff * self.ff(h)
+        return x
+
 
 class DiffusionHead(nn.Module):
     """
-    Lightweight Diffusion Transformer that operates on latent space.
+    DiT-style diffusion transformer for latent denoising.
 
-    Can be attached on top of LDLMAutoencoder latents for
-    diffusion-based generation in latent space.
+    Supports optional prefix conditioning via cross-attention: when a
+    ``context`` tensor (prefix hidden states) is provided, each block
+    cross-attends to it so the diffusion head can generate continuations
+    rather than unconditional samples.
 
-    Supports self-conditioning (LDLM Section 4.2): with probability 0.5,
-    the denoiser receives its own previous estimate as additional input.
+    - Sinusoidal time embedding (not raw scalar)
+    - Learned 1D position embeddings (breaks permutation symmetry)
+    - AdaLN-Zero conditioning at every layer (not additive-once)
+    - Self-conditioning via proj_in concat
+    - Cross-attention to prefix context (optional)
     """
-    def __init__(self, dim: int = 2048, depth: int = 12, heads: int = 8):
+    def __init__(self, dim: int = 2048, depth: int = 12, heads: int = 8,
+                 max_seq_len: int = 512, cross_attn: bool = False):
         super().__init__()
         self.dim = dim
         self.depth = depth
+        self.has_cross_attn = cross_attn
 
+        time_inner = min(dim, 1024)
         self.time_mlp = nn.Sequential(
-            nn.Linear(1, dim),
+            nn.Linear(time_inner, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
+        self.time_embed_dim = time_inner
+
+        self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)
 
         self.proj_in = nn.Linear(dim * 2, dim)
 
-        self.blocks = nn.ModuleList()
-        for _ in range(depth):
-            self.blocks.append(nn.ModuleList([
-                nn.LayerNorm(dim),
-                SelfAttention(dim, heads=heads),
-                nn.LayerNorm(dim),
-                FeedForward(dim),
-            ]))
+        self.blocks = nn.ModuleList([
+            AdaLNDiTBlock(dim, heads=heads, has_cross_attn=cross_attn)
+            for _ in range(depth)
+        ])
 
-        self.out_norm = nn.LayerNorm(dim)
+        self.out_norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.out_adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 2 * dim),
+        )
 
-    def forward(self, z: torch.Tensor, t: torch.Tensor, z_hat_prev: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            z: (B, T, dim) noisy latent
-            t: (B,) or (B, 1) timestep in [0, 1]
-            z_hat_prev: (B, T, dim) optional previous denoised estimate for self-conditioning
-        Returns:
-            denoised prediction of same shape as z
-        """
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
-        t_emb = self.time_mlp(t.float()).unsqueeze(1)
+    def forward(self, z: torch.Tensor, t: torch.Tensor,
+                z_hat_prev: Optional[torch.Tensor] = None,
+                context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, T, _ = z.shape
+        if t.dim() == 2:
+            t = t.squeeze(-1)
+        t_emb = sinusoidal_embedding(t, self.time_embed_dim).to(z.dtype)
+        cond = self.time_mlp(t_emb)
 
-        if z_hat_prev is not None:
-            x = self.proj_in(torch.cat([z, z_hat_prev], dim=-1))
-        else:
-            x = z
-        x = x + t_emb
-        for norm1, attn, norm2, ff in self.blocks:
-            x = attn(norm1(x)) + x
-            x = ff(norm2(x)) + x
+        if z_hat_prev is None:
+            z_hat_prev = torch.zeros_like(z)
+        x = self.proj_in(torch.cat([z, z_hat_prev], dim=-1))
+        x = x + self.pos_embed[:, :T, :]
 
-        return self.out_norm(x)
+        for block in self.blocks:
+            x = block(x, cond, context=context)
+
+        shift, scale = self.out_adaLN(cond).unsqueeze(1).chunk(2, dim=-1)
+        x = self.out_norm(x) * (1 + scale) + shift
+        return x
 
 
 ModelClass = LDLMAutoencoder

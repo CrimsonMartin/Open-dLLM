@@ -16,6 +16,7 @@ from .autoencoder import LDLMAutoencoder, DiffusionHead, PerceiverResampler, Mod
 from .sampler import AdaptiveTimestepSampler
 from .config import LDLMArguments
 from .trainer_patch import LDLMTrainer
+from .generate import generate, LDLMGenerationConfig
 
 __all__ = [
     "LDLMAutoencoder",
@@ -24,4 +25,6 @@ __all__ = [
     "AdaptiveTimestepSampler",
     "LDLMArguments",
     "LDLMTrainer",
+    "generate",
+    "LDLMGenerationConfig",
 ]

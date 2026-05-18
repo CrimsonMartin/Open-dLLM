@@ -1,0 +1,68 @@
+model:
+  model_path: /workspace/models/qwen2.5-0.5b
+  attn_implementation: eager
+  ldlm:
+    enabled: true
+    encoder_model_name: /workspace/models/qwen2.5-0.5b
+    seq_len: 8
+    depth: 4
+    decoder_noise_std: 0.5
+    encoder_hidden_layer: -1
+    decoder_num_layers: 2
+    diffusion_head_depth: 12
+    share_lm_head: true
+    cross_attn: true
+    warmup_steps: 5000
+    warmup_gamma_min: 0.001
+    tangent_d: 3.0
+    self_condition_prob: 0.5
+    log_interval: 50
+    gen_eval_interval: 1000
+    log_latent_histograms: true
+    log_samples: true
+    encoder_on_gpu: true
+
+data:
+  train_path: /workspace/data/fineweb_5m.jsonl,/workspace/data/codeparrot_1m.jsonl
+  train_size: 1000000000000
+  dataloader_type: native
+  datasets_type: preload
+  data_type: plaintext
+  max_seq_len: 16
+  text_keys: text
+  drop_last: true
+  num_workers: 4
+
+train:
+  output_dir: Qwen2.5-0.5B_LDLM_v12
+  data_parallel_mode: ddp
+  ulysses_parallel_size: 1
+  global_batch_size: 256
+  micro_batch_size: 256
+  rmpad: false
+  rmpad_with_pos_ids: true
+  bsz_warmup_ratio: 0.0
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.01
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: false
+  enable_full_shard: false
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda
+  enable_full_determinism: false
+  empty_cache_steps: 100
+  ckpt_manager: dcp
+  auto_resume: false
+  save_steps: 2000
+  save_hf_weights: true
+  use_wandb: false
+  wandb_project: Qwen2.5-0.5B-LDLM
+  wandb_name: Qwen2.5-0.5B-LDLM-v12
